@@ -1,4 +1,5 @@
 from fastapi import Request as FastAPIRequest
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi_offline import FastAPIOffline
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
@@ -10,6 +11,15 @@ from common.api import DeepSeekAPI
 from common.config import DEEPSEEK_API_KEY
 
 app = FastAPIOffline()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 api = DeepSeekAPI(DEEPSEEK_API_KEY)
 
@@ -344,6 +354,14 @@ async def chat_completions(request: ChatRequest):
             else:
                 # اگر خطا از نوع session نبود یا تلاش مجدد تمام شد، خطا را propagate کن
                 raise e
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "DeepSeek API Proxy is running"}
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
 @app.get("/v1/models")
 async def list_models():
     return {"object": "list", "data": AVAILABLE_MODELS}

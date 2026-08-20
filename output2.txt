@@ -1,0 +1,61 @@
+Sending first request...
+First response status: 200
+First response: {
+  "id": "chatcmpl-065c7aa8-8e5f-44ff-9a5a-ed7c24a72f8f",
+  "object": "chat.completion",
+  "created": 1782031190,
+  "model": "thinking_not_search",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "سلام علی جان! خیلی خوش‌وقتم. \n\nاسم من DeepSeek است، یک دستیار هوش مصنوعی. خیلی خوشحالم که با هم آشنا شدیم. \n\nچطور می‌توانم امروز به شما کمک کنم؟ هر سوالی دارید یا کاری از دستم برمی‌آید، خوشحال می‌شوم کمک کنم. 😊",
+        "reasoning_content": "1.  **Analyze the User's Input**:\n    *   Language: Persian (Farsi).\n    *   Content: \"سلام، اسم من علی است\" (Hello, my name is Ali).\n    *   Intent: Greeting and self-introduction. The user is starting a conversation.\n\n2.  **Determine the Appropriate Response**:\n    *   Greet the user back in Persian.\n    *   Acknowledge their name politely.\n    *   Offer assistance and ask how I can help them today to keep the conversation flowing.\n    *   Tone: Warm, respectful, and professional.\n\n3.  **Review against guidelines**: No safety issues. Helpful and direct. (Self-correction: Ensure the response is not overly verbose, just a friendly and helpful opening)."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0
+  },
+  "session_id": "065c7aa8-8e5f-44ff-9a5a-ed7c24a72f8f",
+  "response_message_id": 2
+}
+Session ID: 065c7aa8-8e5f-44ff-9a5a-ed7c24a72f8f
+
+Sending second request with session_id: 065c7aa8-8e5f-44ff-9a5a-ed7c24a72f8f
+Second response status: 200
+Second response: {
+  "id": "chatcmpl-065c7aa8-8e5f-44ff-9a5a-ed7c24a72f8f",
+  "object": "chat.completion",
+  "created": 1782031198,
+  "model": "thinking_not_search",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "بله، قطعاً یادم هست! شما در اولین پیام خودتان گفتید: «سلام، اسم من علی است» و من هم در همان پاسخ به شما گفتم «سلام علی جان!» \n\nچون گفت‌وگوی ما در همین صفحه ادامه دارد، اسم شما را کاملاً به خاطر دارم. البته اگر دوست دارید من شما را با اسم دیگری صدا بزنم یا با «علی جان» راحت‌ترید، به من بگویید. \n\nحالا علی جان، بفرمایید چطور می‌توانم کمکتان کنم؟ 😊",
+        "reasoning_content": ".  **Analyze the User's Request**: The user is asking in Persian (\"اسم من را به خاطر داری؟\") which translates to \"Do you remember my name?\".\n2.  **Check Context**: The user previously said \"سلام، اسم من علی است\" (Hello, my name is Ali). The assistant responded with \"سلام علی جان!\" (Hello dear Ali!).\n3.  **Determine the AI's Capabilities**: I am a stateless conversational AI in this chat session. *However*, within this specific ongoing conversation thread, the context *is* retained. Therefore, I *do* remember that the user introduced themselves as Ali in the very first turn of this conversation.\n4.  **Formulate the Response**:\n    *   Acknowledge that yes, I remember.\n    *   Point back to the first message where they introduced themselves.\n    *   Reiterate their name (Ali) to confirm.\n    *   Ask if they prefer a nickname or if I should continue using \"Ali\" or \"Ali jan\".\n    *   Keep the tone warm and friendly in Persian."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0
+  },
+  "session_id": "065c7aa8-8e5f-44ff-9a5a-ed7c24a72f8f",
+  "response_message_id": 4
+}
+
+Assistant response (second): بله، قطعاً یادم هست! شما در اولین پیام خودتان گفتید: «سلام، اسم من علی است» و من هم در همان پاسخ به شما گفتم «سلام علی جان!» 
+
+چون گفت‌وگوی ما در همین صفحه ادامه دارد، اسم شما را کاملاً به خاطر دارم. البته اگر دوست دارید من شما را با اسم دیگری صدا بزنم یا با «علی جان» راحت‌ترید، به من بگویید. 
+
+حالا علی جان، بفرمایید چطور می‌توانم کمکتان کنم؟ 😊
+✅ Session works: assistant remembered the name.
