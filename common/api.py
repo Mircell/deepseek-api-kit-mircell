@@ -425,3 +425,77 @@ class DeepSeekAPI:
 
         except requests.exceptions.RequestException as e:
             raise NetworkError(f"Network error occurred during streaming: {str(e)}")
+
+    def chat_completion_with_messages(self,
+                    chat_session_id: str,
+                    messages: list,
+                    thinking_enabled: bool = True,
+                    search_enabled: bool = True) -> Generator[Dict[str, Any], None, None]:
+        """
+        Send a message and get streaming response
+
+        Args:
+            chat_session_id (str): The ID of the chat session
+            messages (list): The messages to send
+            thinking_enabled (bool): Whether to show the thinking process
+            search_enabled (bool): Whether to enable web search for up-to-date information
+
+        Returns:
+            Generator[Dict[str, Any], None, None]: Yields message chunks with content and type
+
+        Raises:
+            AuthenticationError: If the authentication token is invalid
+            RateLimitError: If the API rate limit is exceeded
+            NetworkError: If a network error occurs
+            APIError: If any other API error occurs
+        """
+        if not messages or not isinstance(messages, list):
+            raise ValueError("messages must be a non-empty list")
+
+        json_data = {
+            'chat_session_id': chat_session_id,
+            'prompt': messages,
+            'thinking_enabled': thinking_enabled,
+            'search_enabled': search_enabled,
+        }
+
+        try:
+            headers = self._get_headers(
+                pow_response=self.pow_solver.solve_challenge(
+                    self._get_pow_challenge()
+                )
+            )
+
+            response = requests.post(
+                f"{self.BASE_URL}/chat/completion",
+                headers=headers,
+                json=json_data,
+                cookies=self.cookies,  # Add cookies
+                impersonate='chrome120',
+                stream=True,
+                timeout=None
+            )
+
+            if response.status_code != 200:
+                error_text = next(response.iter_lines(), b'').decode('utf-8', 'ignore')
+                if response.status_code == 401:
+                    raise AuthenticationError("Invalid or expired authentication token")
+                elif response.status_code == 429:
+                    raise RateLimitError("API rate limit exceeded")
+                else:
+                    raise APIError(f"API request failed: {error_text}", response.status_code)
+
+            # ایجاد یک parser جدید برای این درخواست (برای جلوگیری از تداخل وضعیت بین درخواست‌ها)
+            parser = SSEMessageParser()
+            for chunk in response.iter_lines():
+                try:
+                    # استفاده از نسخه streaming
+                    for partial in parser.parse_sse_streaming(chunk):
+                        yield partial
+                        if partial.get('type') == 'finished' and partial.get('finished_status') == 'FINISHED':
+                            return  # پایان مولد
+                except Exception as e:
+                    raise APIError(f"Error parsing response chunk: {str(e)}")
+
+        except requests.exceptions.RequestException as e:
+            raise NetworkError(f"Network error occurred during streaming: {str(e)}")
