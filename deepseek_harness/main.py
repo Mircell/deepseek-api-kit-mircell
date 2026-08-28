@@ -4,12 +4,13 @@ from fastapi_offline import FastAPIOffline
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from typing import List, Optional, Union, Dict, Any
-import re
-import time, json, os, uuid
+import time, json, os, uuid, re
 from datetime import datetime
 from pathlib import Path
 from common.api import DeepSeekAPI
 from common.config import DEEPSEEK_API_KEY
+from .adapter import DeepSeekAdapter
+from .dsml_parser import parse_tool_calls_from_text, remove_tool_tags
 
 app = FastAPIOffline()
 
@@ -22,7 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-api = DeepSeekAPI(DEEPSEEK_API_KEY)
+api = DeepSeekAdapter(DEEPSEEK_API_KEY)
 
 sessions: Dict[str, dict] = {}
 SESSION_FILE = Path(__file__).parent.parent / ".session_id"
@@ -100,14 +101,8 @@ AVAILABLE_MODELS = [{"id": "thinking_not_search", "object": "model","created": 1
 
 # ---------- Models ----------
 class ContentPart(BaseModel):
-    model_config = {"extra": "allow"}
-
     type: str = "text"
     text: Optional[str] = ""
-    content: Optional[Union[str, List[Dict[str, Any]]]] = None
-    tool_use_id: Optional[str] = None
-    name: Optional[str] = None
-    input: Optional[Dict[str, Any]] = None
 
 class Message(BaseModel):
     role: str = "user"
@@ -141,168 +136,21 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
-
-class MessagesRequest(BaseModel):
-    model_config = {"extra": "ignore"}
-
-    model: str = "thinking_not_search"
-    messages: List[Message]
-    system: Optional[Union[str, List[ContentPart]]] = None
-    tools: Optional[List[Dict[str, Any]]] = None
-    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
-    max_tokens: int = 16000
-    stream: bool = False
-    temperature: Optional[float] = None
-    session_id: Optional[str] = None
     
 # ---------- Helper ----------
 def extract_content(content: Union[str, List[ContentPart]]) -> str:
     if isinstance(content, str):
         return content
-    parts = []
-    for part in content:
-        if part.type == "text":
-            parts.append(part.text or "")
-        elif part.type == "tool_result":
-            result = part.content if part.content is not None else part.text or ""
-            parts.append(f"[TOOL_RESULT {part.tool_use_id}]\n{result}")
-        elif part.type == "tool_use":
-            parts.append(
-                f"[TOOL_CALL {part.name}]\n{json.dumps(part.input or {}, ensure_ascii=False)}"
-            )
-    return "\n".join(parts)
+    return "\n".join(part.text or "" for part in content if part.type == "text")
 
-def messages_to_api_format(
-    messages: List[Message],
-    include_history: bool = True,
-    tools: Optional[List[Dict[str, Any]]] = None,
-    tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
-) -> str:
-    """تبدیل پیام‌های OpenAI به prompt مورد انتظار DeepSeek."""
-    if not include_history:
-        messages = [message for message in reversed(messages) if message.role == "user"][:1]
-        messages.reverse()
-
+def messages_to_api_format(messages: List[Message]) -> str:
+    """تبدیل messages به فرمت API (اگر API از آرایه messages پشتیبانی کنه)"""
     parts = []
     for msg in messages:
         content = extract_content(msg.content)
         parts.append(f"[{msg.role.upper()}]\n{content}")
-
-    if tools:
-        tool_lines = [
-            "You can call tools when needed. Reply with exactly one JSON object inside this tag:",
-            "<tool_call>{\"name\":\"tool_name\",\"input\":{}}</tool_call>",
-            "Available tools:",
-        ]
-        for tool in tools:
-            tool_lines.append(json.dumps(tool, ensure_ascii=False))
-        if tool_choice:
-            tool_lines.append(f"Requested tool choice: {json.dumps(tool_choice, ensure_ascii=False)}")
-        parts.insert(0, "\n".join(tool_lines))
     return "\n\n".join(parts)
 
-def messages_api_to_chat_request(request: MessagesRequest) -> ChatRequest:
-    messages = list(request.messages)
-    if request.system:
-        messages.insert(0, Message(role="system", content=request.system))
-
-    return ChatRequest(
-        model=request.model,
-        messages=messages,
-        stream=request.stream,
-        temperature=request.temperature,
-        max_tokens=request.max_tokens,
-        session_id=request.session_id,
-        tools=request.tools,
-        tool_choice=request.tool_choice,
-    )
-
-def parse_tool_call(
-    text: str,
-    tools: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[Dict[str, Any]]:
-    marker_patterns = (
-        r"<tool_call>\s*",
-        r"\[TOOL_CALL\s+([A-Za-z_][\w.-]*)\]\s*",
-        r"```(?:json)?\s*",
-    )
-    marker = None
-    marker_tool_name = None
-    for pattern in marker_patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-        if match and (marker is None or match.start() < marker.start()):
-            marker = match
-            marker_tool_name = match.group(1) if match.lastindex else None
-
-    payload = text[marker.end():] if marker else text.lstrip()
-    object_start = payload.find("{")
-    if object_start < 0:
-        return None
-    try:
-        call, end = json.JSONDecoder().raw_decode(payload[object_start:])
-    except json.JSONDecodeError:
-        return None
-    if marker and marker.group(0).lstrip().lower().startswith("<tool_call"):
-        if not re.match(r"\s*</tool_call>", payload[object_start + end:], re.DOTALL):
-            return None
-    if not isinstance(call, dict):
-        return None
-    if marker_tool_name and "name" not in call:
-        call = {"name": marker_tool_name, "input": call}
-    if "function" in call and isinstance(call["function"], dict):
-        function = call["function"]
-        call = {"name": function.get("name"), "input": function.get("arguments", function.get("input", {}))}
-        if isinstance(call["input"], str):
-            try:
-                call["input"] = json.loads(call["input"])
-            except json.JSONDecodeError:
-                return None
-    if not isinstance(call.get("name"), str) or not isinstance(call.get("input", {}), dict):
-        return None
-    if tools and call["name"] not in {
-        tool.get("name") or tool.get("function", {}).get("name")
-        for tool in tools
-    }:
-        return None
-    return {
-        "id": f"toolu_{uuid.uuid4().hex}",
-        "name": call["name"],
-        "input": call.get("input", {}),
-    }
-
-def chat_response_to_messages_response(response: dict) -> dict:
-    choice = response.get("choices", [{}])[0]
-    message = choice.get("message", {})
-    content = message.get("content") or ""
-    tool_calls = message.get("tool_calls") or []
-    blocks = [{"type": "text", "text": content}] if content else []
-    for tool_call in tool_calls:
-        function = tool_call.get("function", {})
-        try:
-            tool_input = json.loads(function.get("arguments", "{}"))
-        except json.JSONDecodeError:
-            tool_input = {}
-        blocks.append({
-            "type": "tool_use",
-            "id": tool_call.get("id", f"toolu_{uuid.uuid4().hex}"),
-            "name": function.get("name", ""),
-            "input": tool_input,
-        })
-    return {
-        "id": response.get("id", f"msg_{uuid.uuid4().hex}"),
-        "type": "message",
-        "role": "assistant",
-        "model": response.get("model"),
-        "content": blocks,
-        "stop_reason": "tool_use" if tool_calls else "end_turn",
-        "stop_sequence": None,
-        "usage": {
-            "input_tokens": response.get("usage", {}).get("prompt_tokens", 0),
-            "output_tokens": response.get("usage", {}).get("completion_tokens", 0),
-        },
-        "session_id": response.get("session_id"),
-        "response_message_id": response.get("response_message_id"),
-    }
 # ---------- Middleware برای لاگ ----------
 @app.middleware("http")
 async def log_time(request: FastAPIRequest, call_next):
@@ -340,12 +188,11 @@ async def chat_completions(request: ChatRequest):
             
             parent_message_id = sessions.get(chat_id, {}).get("last_message_id")
             
-            prompt = messages_to_api_format(
-                request.messages,
-                include_history=parent_message_id is None,
-                tools=request.tools,
-                tool_choice=request.tool_choice,
-            )
+            # Build messages list for API
+            messages_list = []
+            for msg in request.messages:
+                content = extract_content(msg.content)
+                messages_list.append({"role": msg.role, "content": content})
 
             if request.model=="not_thinking_not_search":
                     thinking=False
@@ -370,10 +217,12 @@ async def chat_completions(request: ChatRequest):
                         # ارسال به API با کل history
                         for chunk in api.chat_completion(
                             chat_id, 
-                            prompt,  # کل messages به صورت prompt
+                            messages=messages_list,
                             parent_message_id=parent_message_id,
                             thinking_enabled=thinking,
-                            search_enabled=search
+                            search_enabled=search,
+                            tools=request.tools,
+                            tool_choice=request.tool_choice
                         ):
                             chunk_type = chunk.get("type")
                             
@@ -459,10 +308,12 @@ async def chat_completions(request: ChatRequest):
             
             for chunk in api.chat_completion(
                 chat_id, 
-                prompt,  # کل messages
+                messages=messages_list,
                 parent_message_id=parent_message_id,
                 thinking_enabled=thinking,
-                search_enabled=search
+                search_enabled=search,
+                tools=request.tools,
+                tool_choice=request.tool_choice
             ):
                 chunk_type = chunk.get("type")
                     
@@ -484,26 +335,24 @@ async def chat_completions(request: ChatRequest):
                 # ذخیره در فایل
                 save_session_to_file(chat_id, last_response_message_id)
 
-            tool_call = parse_tool_call(full_text, request.tools) if request.tools else None
+            # تشخیص tool calls
+            tool_calls = parse_tool_calls_from_text(full_text)
+            clean_text = remove_tool_tags(full_text) if tool_calls else full_text
+            
             response_message = {
                 "role": "assistant",
-                "content": None if tool_call else full_text,
+                "content": clean_text if clean_text else None,
                 "reasoning_content": full_thinking if full_thinking else None,
             }
+            
+            if tool_calls:
+                response_message["tool_calls"] = tool_calls
+            
             response_choice = {
                 "index": 0,
                 "message": response_message,
-                "finish_reason": "tool_calls" if tool_call else "stop",
+                "finish_reason": "tool_calls" if tool_calls else "stop",
             }
-            if tool_call:
-                response_message["tool_calls"] = [{
-                    "id": tool_call["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tool_call["name"],
-                        "arguments": json.dumps(tool_call["input"], ensure_ascii=False),
-                    },
-                }]
 
             return {
                 "id": f"chatcmpl-{chat_id}",
@@ -526,63 +375,6 @@ async def chat_completions(request: ChatRequest):
             else:
                 # اگر خطا از نوع session نبود یا تلاش مجدد تمام شد، خطا را propagate کن
                 raise e
-
-@app.post("/v1/messages")
-async def messages(request: MessagesRequest):
-    chat_request = messages_api_to_chat_request(request)
-
-    # Buffer the backend response so both text and tool_use use one reliable SSE path.
-    response = await chat_completions(chat_request.model_copy(update={"stream": False}))
-    messages_response = chat_response_to_messages_response(response)
-
-    if not request.stream:
-        return messages_response
-
-    async def generate_messages_events():
-
-        def event(event_type: str, data: dict) -> str:
-            return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
-
-        message = {
-            key: messages_response[key]
-            for key in ("id", "type", "role", "model")
-        }
-        message.update({
-            "content": [],
-            "stop_reason": None,
-            "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
-        })
-        yield event("message_start", {
-            "type": "message_start",
-            "message": message,
-        })
-        for index, block in enumerate(messages_response["content"]):
-            block_type = block.get("type")
-            if block_type == "text":
-                stream_block = {"type": "text", "text": ""}
-            elif block_type == "tool_use":
-                stream_block = {"type": "tool_use", "id": block["id"], "name": block["name"], "input": {}}
-            else:
-                continue
-            yield event("content_block_start", {"type": "content_block_start", "index": index, "content_block": stream_block})
-            if block_type == "text" and block.get("text"):
-                yield event("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": block["text"]}})
-            elif block_type == "tool_use":
-                yield event("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": json.dumps(block.get("input", {}), ensure_ascii=False)}})
-            yield event("content_block_stop", {
-                "type": "content_block_stop",
-                "index": index,
-            })
-        yield event("message_delta", {"type": "message_delta", "delta": {"stop_reason": messages_response["stop_reason"], "stop_sequence": None}, "usage": messages_response["usage"]})
-        yield event("message_stop", {"type": "message_stop"})
-
-    return StreamingResponse(
-        generate_messages_events(),
-        media_type="text/event-stream",
-        headers={"cache-control": "no-cache", "connection": "keep-alive"},
-    )
-
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "DeepSeek API Proxy is running"}

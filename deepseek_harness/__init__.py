@@ -1,1 +1,1 @@
-# VS Code Chat Proxy for DeepSeek API
+# Open AI Chat Proxy for DeepSeek API
