@@ -1,5 +1,6 @@
 fastapi
 fastapi-offline
+fastapi-openai-compat
 pydantic
 requests
 curl-cffi
