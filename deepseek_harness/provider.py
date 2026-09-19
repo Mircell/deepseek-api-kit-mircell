@@ -193,6 +193,87 @@ def _collect(prompt: str, thinking: bool, search: bool, chat_id: str, parent_mes
     return full_text, full_thinking, response_id
 
 
+def _tool_call_chunks(model: str, chat_id: str, tool_calls: list[dict]) -> list[ChatCompletion]:
+    """Build OpenAI-conformant streaming tool-call deltas.
+
+    Each tool call is announced with a stable ``index`` plus id/name, then its
+    JSON arguments are appended in a second delta with the SAME ``index``. The
+    ``index`` is required by the OpenAI streaming contract; without it a
+    client's tool-call accumulator produces ``undefined`` entries and crashes.
+    """
+    chunks: list[ChatCompletion] = []
+
+    announce = []
+    for i, call in enumerate(tool_calls):
+        fn = call.get("function", {})
+        announce.append(
+            {
+                "index": i,
+                "id": call.get("id", f"call_{i}"),
+                "type": "function",
+                "function": {"name": fn.get("name", ""), "arguments": ""},
+            }
+        )
+    if announce:
+        chunks.append(_chunk(model, chat_id, Message(role="assistant", tool_calls=announce)))
+
+    for i, call in enumerate(tool_calls):
+        fn = call.get("function", {})
+        arg_delta = [{"index": i, "function": {"arguments": fn.get("arguments", "")}}]
+        chunks.append(_chunk(model, chat_id, Message(role="assistant", tool_calls=arg_delta)))
+
+    return chunks
+
+
+class _ToolTagSuppressor:
+    """Keep textual tool-call XML out of streamed assistant content.
+
+    DeepSeek emits tool calls as XML text, and the proxy also converts them into
+    native OpenAI ``tool_calls``. Emitting the raw XML in ``content`` makes the
+    client see the same call twice (once as text, once as a tool call), which
+    strict OpenAI clients reject. This holds back a short tail so a tag split
+    across deltas is never emitted, and stops emitting once a known tool opening
+    tag (or a DSML marker) appears.
+    """
+
+    def __init__(self, tool_names: list[str], holdback: int = 64) -> None:
+        self.tags = tuple(f"<{name}" for name in tool_names) + ("<\uff5cDSML\uff5c",)
+        self.holdback = holdback
+        self.buf = ""
+        self.suppressed = False
+
+    def _first_tag(self) -> int:
+        best = -1
+        for tag in self.tags:
+            idx = self.buf.find(tag)
+            if idx != -1 and (best == -1 or idx < best):
+                best = idx
+        return best
+
+    def feed(self, delta: str) -> str:
+        if self.suppressed:
+            return ""
+        self.buf += delta
+        idx = self._first_tag()
+        if idx != -1:
+            visible = self.buf[:idx]
+            self.buf = ""
+            self.suppressed = True
+            return visible
+        if len(self.buf) > self.holdback:
+            visible = self.buf[: -self.holdback]
+            self.buf = self.buf[-self.holdback:]
+            return visible
+        return ""
+
+    def flush(self) -> str:
+        if self.suppressed:
+            return ""
+        visible = self.buf
+        self.buf = ""
+        return visible
+
+
 def _stream(
     model: str,
     thinking: bool,
@@ -202,6 +283,9 @@ def _stream(
 ) -> Generator[ChatCompletion, None, None]:
     store = _session()
     tools = body.get("tools")
+    # Tool names come from the request schema; without a schema the opening tags
+    # are unknown, so XML suppression is skipped and content passes through.
+    tool_names = list(build_tool_params(tools).keys()) if tools else []
 
     full_text = ""
     last_response_message_id = None
@@ -215,6 +299,7 @@ def _stream(
         full_text = ""
         last_response_message_id = None
         has_content = False
+        suppressor = _ToolTagSuppressor(tool_names) if tool_names else None
 
         try:
             for piece in _consume(prompt, thinking, search, chat_id, parent_message_id):
@@ -229,7 +314,12 @@ def _stream(
                     if delta:
                         has_content = True
                         full_text += delta
-                        yield _chunk(model, chat_id, Message(role="assistant", content=delta))
+                        if suppressor is None:
+                            yield _chunk(model, chat_id, Message(role="assistant", content=delta))
+                        else:
+                            visible = suppressor.feed(delta)
+                            if visible:
+                                yield _chunk(model, chat_id, Message(role="assistant", content=visible))
                 elif kind == "finished":
                     last_response_message_id = piece.get("response_message_id")
                     break
@@ -239,6 +329,11 @@ def _stream(
                 raise
             store.reset(api)
             continue
+
+        if suppressor is not None:
+            tail = suppressor.flush()
+            if tail:
+                yield _chunk(model, chat_id, Message(role="assistant", content=tail))
 
         if has_content or last_response_message_id is not None:
             break
@@ -252,15 +347,12 @@ def _stream(
     if last_response_message_id:
         store.update(chat_id, last_response_message_id)
 
-    # Tool calls detected in the aggregated text become a dedicated delta.
+    # Tool calls detected in the aggregated text become indexed stream deltas.
     tool_calls = parse_tool_calls_from_text(full_text, tools)
     if tool_calls:
-        yield _chunk(
-            model,
-            chat_id,
-            Message(role="assistant", tool_calls=tool_calls),
-            finish_reason="tool_calls",
-        )
+        for chunk in _tool_call_chunks(model, chat_id, tool_calls):
+            yield chunk
+        yield _chunk(model, chat_id, Message(role="assistant"), finish_reason="tool_calls")
     else:
         yield _chunk(model, chat_id, Message(role="assistant"), finish_reason="stop")
 
