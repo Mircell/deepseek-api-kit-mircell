@@ -91,19 +91,43 @@ def _tools_instruction(tools: Optional[list[dict]]) -> str:
     DeepSeek's web chat has no native tool-calling, so we describe the exact
     XML block the model must produce for each available tool, including the
     canonical parameter names the harness validates against.
+
+    The worked example uses a REAL tool name and REAL parameter tags from the
+    current request. It deliberately avoids literal ``tool_name`` /
+    ``param_name`` placeholders: some models copy those verbatim and emit e.g.
+    ``<tool_name>web_fetch</tool_name>`` instead of ``<web_fetch>``, which the
+    parser cannot match.
     """
     params_by_tool = build_tool_params(tools)
     if not params_by_tool:
         return ""
 
+    # Choose a representative tool that actually has parameters, so the model
+    # sees concrete parameter tags in the example.
+    example_name: Optional[str] = None
+    for name, params in params_by_tool.items():
+        if params:
+            example_name = name
+            break
+    if example_name is None:
+        example_name = next(iter(params_by_tool))
+
+    example_lines = [f"<{example_name}>"]
+    for param in params_by_tool[example_name]:
+        example_lines.append(f"<{param}>value</{param}>")
+    example_lines.append(f"</{example_name}>")
+    example_block = "\n".join(example_lines)
+
     lines = [
-        "You can call tools. To call a tool, emit ONLY an XML block like:",
-        "<tool_name>",
-        "<param_name>value</param_name>",
-        "...",
-        "</tool_name>",
+        "To call a tool, emit ONLY one XML block, using the tool's REAL name as the tag:",
         "",
-        "Do NOT wrap values in JSON unless the parameter itself is a list/object.",
+        example_block,
+        "",
+        f'- The tag is the tool name (for example <{example_name}>), never the literal word "tool_name".',
+        "- One tag per parameter, named exactly as listed below.",
+        "- Emit one tool call per block; no prose and no markdown fences around the block.",
+        "- Do NOT wrap values in JSON unless the value itself is a list/object.",
+        "",
         "Available tools and their exact parameter names:",
     ]
     for name, params in params_by_tool.items():

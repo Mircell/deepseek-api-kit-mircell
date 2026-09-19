@@ -70,6 +70,14 @@ _DSML_INVOKE = r"<｜DSML｜invoke\s+name=\"([^\"]+)\"\s*>(.*?)</｜DSML｜invok
 _DSML_PARAM = r"<｜DSML｜parameter\s+name=\"([^\"]+)\"\s+string=\"([^\"]+)\"\s*>(.*?)</｜DSML｜parameter>"
 _DSML_TAG = r"<｜DSML｜[^>]*>"
 
+# The literal placeholder some models copy from the prompt guide:
+#   <tool_name>web_fetch</tool_name>
+# followed by sibling parameter tags. The tool name appears as *text* rather
+# than as the tag itself, so the normal balanced-tag pass never sees it.
+_LITERAL_TOOL_NAME_RE = re.compile(
+    r"<tool_name>\s*([A-Za-z0-9_.\-]+)\s*</tool_name>", re.IGNORECASE
+)
+
 
 # ---------------------------------------------------------------------------
 # Balanced tag matching
@@ -201,6 +209,46 @@ def _make_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _parse_literal_tool_name_calls(
+    text: str, tool_params: Dict[str, List[str]]
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """Recover the malformed ``<tool_name>NAME</tool_name>`` call form.
+
+    Some models copy the literal ``tool_name`` placeholder from the prompt
+    guide and emit the tool's real name as *text* inside that tag, followed by
+    the parameter tags and a stray closing ``</tool_name>``. This parses that
+    shape so the call is not silently dropped by the balanced-tag pass.
+    """
+    results: List[Tuple[int, Dict[str, Any]]] = []
+    known = set(tool_params)
+
+    for match in _LITERAL_TOOL_NAME_RE.finditer(text):
+        candidate = match.group(1).strip()
+        if candidate not in known:
+            continue
+
+        # The sibling parameter region runs from after the name's closing tag
+        # to the next opening header or the stray closing tag, whichever is
+        # first; otherwise it runs to the end of the text.
+        body_start = match.end()
+        boundary_positions = [
+            pos
+            for pos in (
+                text.find("<tool_name", body_start),
+                text.find("</tool_name>", body_start),
+            )
+            if pos != -1
+        ]
+        body_end = min(boundary_positions) if boundary_positions else len(text)
+
+        body = text[body_start:body_end]
+        arguments = _extract_params(body, tool_params[candidate])
+        if arguments:
+            results.append((match.start(), _make_call(candidate, arguments)))
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -242,8 +290,45 @@ def parse_tool_calls_from_text(text: str, tools: Optional[List[Any]] = None) -> 
                 continue  # an empty/irrelevant tag, not a real call
             found.append((open_start, _make_call(tool_name, arguments)))
 
+    # 3. Lenient fallback for the malformed literal form the model sometimes
+    #    emits (see _parse_literal_tool_name_calls), so those calls are not lost.
+    found.extend(_parse_literal_tool_name_calls(text, tool_params))
+
     found.sort(key=lambda item: item[0])
     return [call for _, call in found]
+
+
+def _literal_tool_name_spans(
+    text: str, tool_params: Dict[str, List[str]]
+) -> List[Tuple[int, int]]:
+    """Return ``(start, end)`` spans of malformed ``<tool_name>NAME</tool_name>``
+    blocks (including their sibling parameter tags and the stray closing tag),
+    so :func:`remove_tool_tags` can strip the same shapes the parser recovers.
+    """
+    spans: List[Tuple[int, int]] = []
+    known = set(tool_params)
+
+    for match in _LITERAL_TOOL_NAME_RE.finditer(text):
+        if match.group(1).strip() not in known:
+            continue
+
+        body_start = match.end()
+        boundary_positions = [
+            pos
+            for pos in (
+                text.find("<tool_name", body_start),
+                text.find("</tool_name>", body_start),
+            )
+            if pos != -1
+        ]
+        body_end = min(boundary_positions) if boundary_positions else len(text)
+
+        end = body_end
+        if text.startswith("</tool_name>", body_end):
+            end = body_end + len("</tool_name>")
+        spans.append((match.start(), end))
+
+    return spans
 
 
 def remove_tool_tags(text: str, tools: Optional[List[Any]] = None) -> str:
@@ -257,6 +342,10 @@ def remove_tool_tags(text: str, tools: Optional[List[Any]] = None) -> str:
     for tool_name in tool_params:
         for open_start, _, _, close_end in _find_balanced_blocks(text, tool_name):
             spans.append((open_start, close_end))
+
+    # Malformed literal "<tool_name>NAME</tool_name>" blocks (parsed by the
+    # fallback) must also be stripped from the visible message.
+    spans.extend(_literal_tool_name_spans(text, tool_params))
 
     for invoke in re.finditer(_DSML_INVOKE, text, re.DOTALL):
         spans.append((invoke.start(), invoke.end()))

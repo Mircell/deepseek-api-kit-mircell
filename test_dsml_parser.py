@@ -36,6 +36,15 @@ canonical_text = (
     "<write>\n<file_path>a.txt</file_path>\n<content>hello</content>\n</write>"
 )
 
+# 5. The malformed literal "<tool_name>NAME</tool_name>" form some models copy
+#    from the placeholder in the prompt guide, followed by a stray closing tag.
+malformed_text = (
+    "I'll fetch the paper.\n\n"
+    "<tool_name>web_fetch</tool_name>\n"
+    "<url>https://arxiv.org/abs/2607.02770</url>\n"
+    "</tool_name>"
+)
+
 # Tool schema as the DSH harness sends it (parameters.properties keys).
 TOOLS = [
     {"type": "function", "function": {"name": "write", "parameters": {"properties": {"file_path": {}, "content": {}}}}},
@@ -59,3 +68,4 @@ if __name__ == "__main__":
     _show("web_search (JSON array)", search_text)
     _show("web_fetch (url)", fetch_text)
     _show("write (canonical file_path)", canonical_text)
+    _show("web_fetch (malformed literal tool_name)", malformed_text)

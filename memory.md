@@ -215,6 +215,12 @@ OpenAI `tool_calls`.
 - **Alias mapping** rewrites the names the model tends to invent back to the
   canonical schema names (`path` → `file_path`, `query`/`search` → `queries`,
   `link` → `url`, `cmd` → `command`, …).
+- **Malformed literal-form recovery** (`_parse_literal_tool_name_calls`): some
+  models copy the literal `tool_name` placeholder from the prompt guide and
+  emit e.g. `<tool_name>web_fetch</tool_name>` (with the real name as *text*)
+  followed by sibling parameter tags and a stray `</tool_name>`. The parser
+  recovers that shape into a normal call, and `remove_tool_tags` strips it from
+  the visible message too.
 - Public helpers:
   - `build_tool_params(tools)` → `{tool_name: [param, …]}` (with a fallback
     table for well-known tools).
@@ -222,6 +228,14 @@ OpenAI `tool_calls`.
   - `remove_tool_tags(text, tools)` → the same text with the tool blocks
     stripped (used to clean the visible assistant message).
 - Both DSML (full-width-bar) tags and plain XML tags are supported.
+
+### Prompt-guide rule (do not copy the placeholder)
+`provider._tools_instruction` renders a worked example using a **real** tool
+name and its **real** parameter tags from the current request, and states
+explicitly that the tag is the tool's name — never the literal word
+`"tool_name"`. This prevents the model from emitting the malformed
+`<tool_name>NAME</tool_name>` form in the first place; the parser fallback
+above recovers it if it still happens.
 
 ### `provider.py` — streamed tool-call contract
 For streaming, tool calls are emitted as **OpenAI-conformant deltas** via
