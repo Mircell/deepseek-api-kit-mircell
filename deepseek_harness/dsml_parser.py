@@ -12,15 +12,33 @@ tool invocations as plain XML-ish blocks, for example::
     <queries>["a", "b"]</queries>
     </web_search>
 
-This module turns those blocks into the standard OpenAI ``tool_calls`` shape:
+The model frequently ignores that guide and falls back to its own native
+"DSML" dialect, which carries the same information inside full-width-bar
+tags::
+
+    <|DSML|invoke name="web_fetch">
+    <|DSML|parameter name="url" string="true">https://example.com</|DSML|parameter>
+    </|DSML|invoke>
+
+Real emissions of that dialect are sloppy: a space after the bar
+(``<|DSML| invoke``), an optional/missing ``string`` attribute, a
+``<|DSML|calls>`` wrapper, a stray closing tag, and — for large values like a
+file's ``content`` — a **missing or embedded parameter closing tag**. To
+survive that, DSML parameters are not matched with balanced tags; each
+parameter's value simply runs from its own opening tag to the *next*
+parameter's opening tag (or to the end of the invoke), so a missing closing
+tag never drops the call.
+
+Both dialects become the standard OpenAI ``tool_calls`` shape:
 
     {"id": "toolu_...", "type": "function",
      "function": {"name": "write", "arguments": "{\\"file_path\\": ...}"}}
 
-The parser is *balanced* (it matches nested same-name tags) so it does not
-break on HTML ``<`` / ``>`` inside a ``content`` parameter, and it maps common
-alternate parameter names (``path`` -> ``file_path``, ``query`` -> ``queries``,
-``link`` -> ``url``, ...) back to the canonical schema names.
+The parser is *balanced* for the plain-XML dialect (it matches nested
+same-name tags) so it does not break on HTML ``<`` / ``>`` inside a
+``content`` parameter, and it maps common alternate parameter names
+(``path`` -> ``file_path``, ``query`` -> ``queries``, ``link`` -> ``url``,
+...) back to the canonical schema names.
 """
 
 from __future__ import annotations
@@ -51,6 +69,15 @@ _PARAM_ALIASES: Dict[str, Tuple[str, ...]] = {
     "recursive": ("recurse",),
 }
 
+# Reverse lookup: an invented name -> the canonical name it stands for.
+# ``setdefault`` keeps the first owner of a name, so ``path`` stays an alias of
+# ``file_path`` even though ``path`` is itself canonical for ``glob``/``grep``.
+# A declared parameter always wins over this table (see :func:`_canonical_param`).
+_ALIAS_TO_CANON: Dict[str, str] = {}
+for _canon, _aliases in _PARAM_ALIASES.items():
+    for _alias in _aliases:
+        _ALIAS_TO_CANON.setdefault(_alias.lower(), _canon)
+
 # Fallback schema for well-known tools when the caller does not pass `tools`.
 _DEFAULT_TOOL_PARAMS: Dict[str, Tuple[str, ...]] = {
     "write": ("file_path", "content"),
@@ -65,10 +92,27 @@ _DEFAULT_TOOL_PARAMS: Dict[str, Tuple[str, ...]] = {
     "list_files": ("path", "recursive"),
 }
 
-# DSML-style tags (full-width vertical bars around "DSML").
-_DSML_INVOKE = r"<｜DSML｜invoke\s+name=\"([^\"]+)\"\s*>(.*?)</｜DSML｜invoke>"
-_DSML_PARAM = r"<｜DSML｜parameter\s+name=\"([^\"]+)\"\s+string=\"([^\"]+)\"\s*>(.*?)</｜DSML｜parameter>"
-_DSML_TAG = r"<｜DSML｜[^>]*>"
+# The full-width vertical bar the model's native dialect is built from.
+_BAR = "\uff5c"
+_DSML = f"{_BAR}DSML{_BAR}"
+
+# Any native-dialect tag (opening, closing, or the ``calls`` wrapper).
+_DSML_TAG_RE = re.compile(rf"</?{_DSML}\s*[^>]*>", re.IGNORECASE)
+
+# Individual native-dialect tags. The opening tags capture their attribute
+# string (everything up to the first ``>``); the ``name`` attribute is then
+# read out with :data:`_NAME_ATTR_RE`.
+_DSML_INVOKE_OPEN_RE = re.compile(rf"<{_DSML}\s*invoke\b([^>]*)>", re.IGNORECASE)
+_DSML_INVOKE_CLOSE_RE = re.compile(rf"</{_DSML}\s*invoke\s*>", re.IGNORECASE)
+_DSML_PARAM_OPEN_RE = re.compile(rf"<{_DSML}\s*parameter\b([^>]*)>", re.IGNORECASE)
+# A parameter closing tag at the very end of a value (with optional trailing
+# whitespace) is the model's own delimiter and must be stripped from the value.
+_DSML_PARAM_TRAILING_CLOSE_RE = re.compile(
+    rf"</{_DSML}\s*parameter\s*>\s*$", re.IGNORECASE
+)
+
+# Attributes on a native-dialect tag, e.g. name="url" string="true".
+_NAME_ATTR_RE = re.compile(r"""\bname\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.IGNORECASE)
 
 # The literal placeholder some models copy from the prompt guide:
 #   <tool_name>web_fetch</tool_name>
@@ -80,13 +124,14 @@ _LITERAL_TOOL_NAME_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
-# Balanced tag matching
+# Balanced tag matching (plain-XML dialect)
 # ---------------------------------------------------------------------------
 def _find_balanced_blocks(text: str, tag_name: str) -> Iterable[Tuple[int, int, int, int]]:
-    """Yield ``(open_start, body_start, body_end, close_end)`` for balanced tags.
+    """Yield ``(open_start, body_start, body_end, close_end)`` for XML tags.
 
     Nesting of the *same* tag name is tracked, so a ``content`` parameter that
-    contains other markup does not confuse the outer tag match.
+    contains other markup does not confuse the outer tag match. A region whose
+    closing tag is missing is skipped entirely.
     """
     escaped = re.escape(tag_name)
     open_re = re.compile(rf"<{escaped}(?:\s[^<>]*)?>", re.IGNORECASE)
@@ -124,6 +169,46 @@ def _find_balanced_blocks(text: str, tag_name: str) -> Iterable[Tuple[int, int, 
 
 
 # ---------------------------------------------------------------------------
+# Native DSML dialect (lenient, delimiter-based)
+# ---------------------------------------------------------------------------
+def _attr_name(attributes: str) -> Optional[str]:
+    """Read the ``name`` attribute out of a native-dialect tag's attributes."""
+    match = _NAME_ATTR_RE.search(attributes)
+    if not match:
+        return None
+    value = match.group(1) if match.group(1) is not None else match.group(2)
+    value = (value or "").strip()
+    return value or None
+
+
+def _dsml_invoke_regions(text: str) -> Iterable[Tuple[int, int]]:
+    """Yield ``(start, end)`` spans of native-dialect invocations.
+
+    The end is the matching ``</|DSML|invoke>`` when present; otherwise the
+    span runs to the next invocation or to the end of the text, so a missing
+    closing tag never hides a call.
+    """
+    pos = 0
+    while True:
+        open_match = _DSML_INVOKE_OPEN_RE.search(text, pos)
+        if not open_match:
+            return
+
+        next_open = _DSML_INVOKE_OPEN_RE.search(text, open_match.end())
+        close_match = _DSML_INVOKE_CLOSE_RE.search(text, open_match.end())
+
+        if close_match is not None and (
+            next_open is None or close_match.start() < next_open.start()
+        ):
+            end = close_match.end()
+        else:
+            end = next_open.start() if next_open is not None else len(text)
+
+        yield open_match.start(), end
+        pos = end if end > open_match.end() else open_match.end()
+
+
+# ---------------------------------------------------------------------------
 # Value / parameter extraction
 # ---------------------------------------------------------------------------
 def _coerce(value: str) -> Any:
@@ -140,7 +225,7 @@ def _coerce(value: str) -> Any:
 
 
 def _extract_params(body: str, param_names: List[str]) -> Dict[str, Any]:
-    """Extract the declared parameters from a tool-call body."""
+    """Extract the declared parameters from a plain-XML tool-call body."""
     args: Dict[str, Any] = {}
     canon_set = set(param_names)
 
@@ -158,6 +243,78 @@ def _extract_params(body: str, param_names: List[str]) -> Dict[str, Any]:
                 break
 
     return args
+
+
+def _extract_dsml_params(body: str) -> Dict[str, Any]:
+    """Extract native-dialect ``parameter`` values from an invocation body.
+
+    Each value runs from its own opening tag to the next parameter's opening
+    tag (or the end of the body), and any trailing ``</|DSML|parameter>`` is
+    stripped. This does not require the model to emit a closing tag for every
+    parameter, which is exactly what breaks on long ``content`` values.
+    """
+    raw: Dict[str, Any] = {}
+    opens = list(_DSML_PARAM_OPEN_RE.finditer(body))
+
+    for index, open_match in enumerate(opens):
+        param_name = _attr_name(open_match.group(1) or "")
+        if not param_name:
+            continue
+        value_start = open_match.end()
+        value_end = opens[index + 1].start() if index + 1 < len(opens) else len(body)
+        value = body[value_start:value_end]
+        value = _DSML_PARAM_TRAILING_CLOSE_RE.sub("", value)
+        raw[param_name] = _coerce(value)
+
+    return raw
+
+
+def _canonical_param(name: str, param_names: List[str]) -> Optional[str]:
+    """Map an emitted parameter name onto a declared one, or ``None`` if unknown.
+
+    A declared name always wins, which is what lets the same word mean
+    ``file_path`` for ``write`` and ``path`` for ``glob``.
+    """
+    if not param_names:
+        return name
+    declared = {param.lower(): param for param in param_names}
+    lowered = name.lower()
+    if lowered in declared:
+        return declared[lowered]
+    canon = _ALIAS_TO_CANON.get(lowered)
+    if canon is not None and canon.lower() in declared:
+        return declared[canon.lower()]
+    return None
+
+
+def _canonicalize(
+    raw: Dict[str, Any], param_names: List[str], strict: bool
+) -> Dict[str, Any]:
+    """Rewrite/keep emitted parameter names against the declared schema.
+
+    ``strict`` is set when the request actually declared a schema for this
+    tool; undeclared names are then dropped rather than forwarded to the
+    harness, which would reject the call with ``INVALID_ARGS``.
+    """
+    if not strict or not param_names:
+        return dict(raw)
+    result: Dict[str, Any] = {}
+    for key, value in raw.items():
+        canon = _canonical_param(key, param_names)
+        if canon is not None:
+            result[canon] = value
+    return result
+
+
+def _maybe_json_object(value: str) -> Optional[Dict[str, Any]]:
+    """Parse ``value`` as a JSON object, or return ``None``."""
+    if not value.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +355,17 @@ def build_tool_params(tools: Optional[List[Any]]) -> Dict[str, List[str]]:
     return params
 
 
+def _declared_tool_names(tools: Optional[List[Any]]) -> set:
+    """Names the request itself declared (ignoring the built-in fallbacks)."""
+    names = set()
+    for tool in tools or []:
+        fn = _tool_definition(tool)
+        name = fn.get("name")
+        if name:
+            names.add(name)
+    return names
+
+
 def _make_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": f"toolu_{uuid.uuid4().hex[:8]}",
@@ -209,9 +377,81 @@ def _make_call(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Native DSML dialect
+# ---------------------------------------------------------------------------
+def _parse_dsml_calls(
+    text: str,
+    tool_params: Dict[str, List[str]],
+    declared_names: set,
+) -> List[Tuple[int, int, Dict[str, Any]]]:
+    """Parse the model's native ``<|DSML|invoke>`` dialect into tool calls.
+
+    Returns ``(start, end, call)`` triples so the caller can merge these with
+    the XML dialect results in source order.
+    """
+    results: List[Tuple[int, int, Dict[str, Any]]] = []
+    # A schema was declared: only honour tools it actually offers, so a
+    # hallucinated name never reaches the harness.
+    strict_schema = bool(declared_names)
+
+    for start, end in _dsml_invoke_regions(text):
+        invoke = text[start:end]
+        open_match = _DSML_INVOKE_OPEN_RE.match(invoke)
+        if open_match is None:
+            continue
+        tool_name = _attr_name(open_match.group(1) or "")
+        if not tool_name:
+            continue
+        if strict_schema and tool_name not in declared_names:
+            continue
+
+        body = invoke[open_match.end():]
+        # Drop the invocation's own closing tag from the body, if present.
+        body = _DSML_INVOKE_CLOSE_RE.sub("", body, count=1)
+
+        raw = _extract_dsml_params(body)
+        param_names = tool_params.get(tool_name, [])
+        if raw:
+            arguments = _canonicalize(raw, param_names, strict_schema)
+        else:
+            parsed = _maybe_json_object(body.strip())
+            if parsed is not None:
+                arguments = _canonicalize(parsed, param_names, strict_schema)
+            else:
+                arguments = {}
+
+        # A tool that declares parameters but received none is a malformed
+        # emission, not a call — forwarding it only produces INVALID_ARGS.
+        if not arguments and param_names:
+            continue
+
+        results.append((start, end, _make_call(tool_name, arguments)))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Literal ``<tool_name>NAME</tool_name>`` recovery
+# ---------------------------------------------------------------------------
+def _literal_tool_name_region(text: str, match: "re.Match[str]") -> Tuple[int, int]:
+    """Span of the sibling parameter region following a literal ``tool_name`` tag."""
+    body_start = match.end()
+    boundary_positions = [
+        pos
+        for pos in (
+            text.find("<tool_name", body_start),
+            text.find("</tool_name>", body_start),
+        )
+        if pos != -1
+    ]
+    body_end = min(boundary_positions) if boundary_positions else len(text)
+    return body_start, body_end
+
+
 def _parse_literal_tool_name_calls(
     text: str, tool_params: Dict[str, List[str]]
-) -> List[Tuple[int, Dict[str, Any]]]:
+) -> List[Tuple[int, int, Dict[str, Any]]]:
     """Recover the malformed ``<tool_name>NAME</tool_name>`` call form.
 
     Some models copy the literal ``tool_name`` placeholder from the prompt
@@ -219,7 +459,7 @@ def _parse_literal_tool_name_calls(
     the parameter tags and a stray closing ``</tool_name>``. This parses that
     shape so the call is not silently dropped by the balanced-tag pass.
     """
-    results: List[Tuple[int, Dict[str, Any]]] = []
+    results: List[Tuple[int, int, Dict[str, Any]]] = []
     known = set(tool_params)
 
     for match in _LITERAL_TOOL_NAME_RE.finditer(text):
@@ -227,84 +467,20 @@ def _parse_literal_tool_name_calls(
         if candidate not in known:
             continue
 
-        # The sibling parameter region runs from after the name's closing tag
-        # to the next opening header or the stray closing tag, whichever is
-        # first; otherwise it runs to the end of the text.
-        body_start = match.end()
-        boundary_positions = [
-            pos
-            for pos in (
-                text.find("<tool_name", body_start),
-                text.find("</tool_name>", body_start),
-            )
-            if pos != -1
-        ]
-        body_end = min(boundary_positions) if boundary_positions else len(text)
-
+        body_start, body_end = _literal_tool_name_region(text, match)
         body = text[body_start:body_end]
-        arguments = _extract_params(body, tool_params[candidate])
-        if arguments:
-            results.append((match.start(), _make_call(candidate, arguments)))
+        param_names = tool_params[candidate]
+        arguments = _extract_params(body, param_names)
+        if arguments or not param_names:
+            results.append((match.start(), body_end, _make_call(candidate, arguments)))
 
     return results
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-def parse_tool_calls_from_text(text: str, tools: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
-    """Detect tool calls (DSML or XML) and return OpenAI-style ``tool_calls``."""
-    if not text:
-        return []
-
-    # 1. DSML-style invocations take precedence.
-    dsml_calls: List[Dict[str, Any]] = []
-    for invoke in re.finditer(_DSML_INVOKE, text, re.DOTALL):
-        tool_name = invoke.group(1)
-        invoke_body = invoke.group(2)
-
-        arguments: Dict[str, Any] = {}
-        for param in re.finditer(_DSML_PARAM, invoke_body, re.DOTALL):
-            arguments[param.group(1)] = _coerce(param.group(3))
-
-        if not arguments:
-            try:
-                arguments = json.loads(invoke_body.strip())
-            except (json.JSONDecodeError, ValueError):
-                arguments = {"content": invoke_body.strip()}
-
-        dsml_calls.append(_make_call(tool_name, arguments))
-
-    if dsml_calls:
-        return dsml_calls
-
-    # 2. Plain XML-style tool blocks.
-    tool_params = build_tool_params(tools)
-    found: List[Tuple[int, Dict[str, Any]]] = []
-
-    for tool_name, param_names in tool_params.items():
-        for open_start, body_start, body_end, _ in _find_balanced_blocks(text, tool_name):
-            body = text[body_start:body_end]
-            arguments = _extract_params(body, param_names)
-            if not arguments:
-                continue  # an empty/irrelevant tag, not a real call
-            found.append((open_start, _make_call(tool_name, arguments)))
-
-    # 3. Lenient fallback for the malformed literal form the model sometimes
-    #    emits (see _parse_literal_tool_name_calls), so those calls are not lost.
-    found.extend(_parse_literal_tool_name_calls(text, tool_params))
-
-    found.sort(key=lambda item: item[0])
-    return [call for _, call in found]
 
 
 def _literal_tool_name_spans(
     text: str, tool_params: Dict[str, List[str]]
 ) -> List[Tuple[int, int]]:
-    """Return ``(start, end)`` spans of malformed ``<tool_name>NAME</tool_name>``
-    blocks (including their sibling parameter tags and the stray closing tag),
-    so :func:`remove_tool_tags` can strip the same shapes the parser recovers.
-    """
+    """Return spans of malformed literal-form blocks so they can be stripped."""
     spans: List[Tuple[int, int]] = []
     known = set(tool_params)
 
@@ -312,17 +488,7 @@ def _literal_tool_name_spans(
         if match.group(1).strip() not in known:
             continue
 
-        body_start = match.end()
-        boundary_positions = [
-            pos
-            for pos in (
-                text.find("<tool_name", body_start),
-                text.find("</tool_name>", body_start),
-            )
-            if pos != -1
-        ]
-        body_end = min(boundary_positions) if boundary_positions else len(text)
-
+        _, body_end = _literal_tool_name_region(text, match)
         end = body_end
         if text.startswith("</tool_name>", body_end):
             end = body_end + len("</tool_name>")
@@ -331,8 +497,52 @@ def _literal_tool_name_spans(
     return spans
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+def parse_tool_calls_from_text(text: str, tools: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
+    """Detect tool calls (native DSML or plain XML) and return OpenAI ``tool_calls``.
+
+    Both dialects are collected in one pass and returned in source order, so a
+    reply that mixes them does not lose the plain-XML calls.
+    """
+    if not text:
+        return []
+
+    tool_params = build_tool_params(tools)
+    declared_names = _declared_tool_names(tools)
+    found: List[Tuple[int, int, Dict[str, Any]]] = []
+
+    # 1. The model's native DSML dialect.
+    found.extend(_parse_dsml_calls(text, tool_params, declared_names))
+
+    # 2. Plain XML-style tool blocks.
+    for tool_name, param_names in tool_params.items():
+        for open_start, body_start, body_end, close_end in _find_balanced_blocks(text, tool_name):
+            body = text[body_start:body_end]
+            arguments = _extract_params(body, param_names)
+            if not arguments and param_names:
+                continue  # an empty/irrelevant tag, not a real call
+            found.append((open_start, close_end, _make_call(tool_name, arguments)))
+
+    # 3. Lenient fallback for the malformed literal form the model sometimes
+    #    emits (see _parse_literal_tool_name_calls), so those calls are not lost.
+    found.extend(_parse_literal_tool_name_calls(text, tool_params))
+
+    found.sort(key=lambda item: (item[0], item[1]))
+
+    calls: List[Dict[str, Any]] = []
+    last_end = -1
+    for start, end, call in found:
+        if start < last_end:
+            continue  # overlaps a call already accepted
+        calls.append(call)
+        last_end = max(end, start + 1)
+    return calls
+
+
 def remove_tool_tags(text: str, tools: Optional[List[Any]] = None) -> str:
-    """Remove every tool-call block (XML and DSML) from ``text``."""
+    """Remove every tool-call block (plain XML and native DSML) from ``text``."""
     if not text:
         return ""
 
@@ -343,12 +553,13 @@ def remove_tool_tags(text: str, tools: Optional[List[Any]] = None) -> str:
         for open_start, _, _, close_end in _find_balanced_blocks(text, tool_name):
             spans.append((open_start, close_end))
 
+    # Native-dialect invocations (lenient: a missing close runs to the next
+    # invocation or to the end of the text).
+    spans.extend(_dsml_invoke_regions(text))
+
     # Malformed literal "<tool_name>NAME</tool_name>" blocks (parsed by the
     # fallback) must also be stripped from the visible message.
     spans.extend(_literal_tool_name_spans(text, tool_params))
-
-    for invoke in re.finditer(_DSML_INVOKE, text, re.DOTALL):
-        spans.append((invoke.start(), invoke.end()))
 
     spans.sort()
     pieces: List[str] = []
@@ -362,5 +573,7 @@ def remove_tool_tags(text: str, tools: Optional[List[Any]] = None) -> str:
     pieces.append(text[last_end:])
 
     cleaned = "".join(pieces)
-    cleaned = re.sub(_DSML_TAG, "", cleaned)
+    # Drop any leftover native-dialect scaffolding (the ``calls`` wrapper, a
+    # stray closing tag) that was not part of a recognised invocation.
+    cleaned = _DSML_TAG_RE.sub("", cleaned)
     return "\n".join(line.rstrip() for line in cleaned.splitlines() if line.strip())

@@ -205,16 +205,41 @@ OpenAI `tool_calls`.
 ```
 
 ### `dsml_parser.py`
-- **Balanced tag matching** (`_find_balanced_blocks`) tracks nesting of the
-  same tag name, so HTML `<` / `>` inside a `<content>` parameter does not
-  break parsing.
+The parser understands **two dialects** and merges their calls in source
+order. A reply that mixes them no longer loses the plain-XML calls.
+
+- **Plain XML dialect** (what the prompt guide teaches):
+  `<web_fetch><url>…</url></web_fetch>`.
+- **Native DSML dialect** (what the model falls back to): the full-width-bar
+  `<|DSML|invoke name="web_fetch">` / `<|DSML|parameter name="url">` form.
+  The model emits this sloppily — a space after the bar (`<|DSML| invoke`),
+  an optional/missing `string` attribute, a `<|DSML|calls>` wrapper, a stray
+  extra closing tag, and for large values (a file's `content`) a **missing or
+  embedded parameter closing tag**. DSML parameters are therefore **not**
+  matched with balanced tags: each value simply runs from its own opening tag
+  to the next parameter's opening tag (or the end of the invoke), and any
+  trailing `</|DSML|parameter>` is stripped. A missing closing tag can no
+  longer drop the whole call, which is what previously broke `write` while
+  `web_fetch` worked.
+- **Balanced tag matching** (`_find_balanced_blocks`) is used for the plain
+  XML dialect only. It tracks nesting of the same tag name, so HTML `<` / `>`
+  inside a `<content>` parameter does not break parsing.
 - **Declared-parameter extraction** reads only the parameters the request's
   `tools` schema declares, using the tool names as the block tags.
 - **Value coercion** turns `["a","b"]` into a JSON list, numbers into numbers,
   and everything else into strings.
 - **Alias mapping** rewrites the names the model tends to invent back to the
   canonical schema names (`path` → `file_path`, `query`/`search` → `queries`,
-  `link` → `url`, `cmd` → `command`, …).
+  `link` → `url`, `cmd` → `command`, …). This applies to **both** dialects: a
+  DSML `<|DSML|parameter name="link">` becomes `url` for `web_fetch`, so the
+  harness does not reject it with `INVALID_ARGS`.
+- **Schema enforcement** (`_canonicalize`, strict when the request declared a
+  schema): tool names not in the schema are dropped, and undeclared parameter
+  names are dropped, so a hallucinated tool/parameter never reaches the
+  harness. When no schema is supplied the call is forwarded as-is.
+- **Malformed emission rejection**: a native invocation that declares
+  parameters but supplies none is not turned into a bogus
+  `{"content": "…"}` call.
 - **Malformed literal-form recovery** (`_parse_literal_tool_name_calls`): some
   models copy the literal `tool_name` placeholder from the prompt guide and
   emit e.g. `<tool_name>web_fetch</tool_name>` (with the real name as *text*)
@@ -227,15 +252,22 @@ OpenAI `tool_calls`.
   - `parse_tool_calls_from_text(text, tools)` → list of OpenAI `tool_calls`.
   - `remove_tool_tags(text, tools)` → the same text with the tool blocks
     stripped (used to clean the visible assistant message).
-- Both DSML (full-width-bar) tags and plain XML tags are supported.
 
-### Prompt-guide rule (do not copy the placeholder)
+### Prompt-guide rules
 `provider._tools_instruction` renders a worked example using a **real** tool
 name and its **real** parameter tags from the current request, and states
 explicitly that the tag is the tool's name — never the literal word
 `"tool_name"`. This prevents the model from emitting the malformed
 `<tool_name>NAME</tool_name>` form in the first place; the parser fallback
 above recovers it if it still happens.
+
+The guide also **forbids the native DSML dialect outright** ("Use this plain
+XML form ONLY. Do NOT emit any invoke/parameter/markup dialect, and never wrap
+the call in a `calls` element."). Without that explicit prohibition the model
+regularly regresses to its native prior whenever it ignores the guide; naming
+and banning it is what keeps the common path on plain XML. The DSML path in
+the parser remains as a recovery net for the times the model ignores the ban
+anyway.
 
 ### `provider.py` — streamed tool-call contract
 For streaming, tool calls are emitted as **OpenAI-conformant deltas** via

@@ -97,6 +97,10 @@ def _tools_instruction(tools: Optional[list[dict]]) -> str:
     ``param_name`` placeholders: some models copy those verbatim and emit e.g.
     ``<tool_name>web_fetch</tool_name>`` instead of ``<web_fetch>``, which the
     parser cannot match.
+
+    The guide also forbids the model's own native full-width-bar dialect.
+    Without that explicit prohibition the model falls back to it whenever it
+    ignores the guide, which costs a recovery pass instead of a clean read.
     """
     params_by_tool = build_tool_params(tools)
     if not params_by_tool:
@@ -127,6 +131,8 @@ def _tools_instruction(tools: Optional[list[dict]]) -> str:
         "- One tag per parameter, named exactly as listed below.",
         "- Emit one tool call per block; no prose and no markdown fences around the block.",
         "- Do NOT wrap values in JSON unless the value itself is a list/object.",
+        "- Use this plain XML form ONLY. Do NOT emit any invoke/parameter/markup dialect,",
+        '  and never wrap the call in a "calls" element.',
         "",
         "Available tools and their exact parameter names:",
     ]
