@@ -1,34 +1,48 @@
 from curl_cffi import requests
 from typing import Optional, Dict, Any, Generator, Literal
 import json
-from .pow import DeepSeekPOW
+import os
 import sys
-from pathlib import Path
-import subprocess
 import time
+import subprocess
+from pathlib import Path
+from .pow import DeepSeekPOW
 
 ThinkingMode = Literal['detailed', 'simple', 'disabled']
 SearchMode = Literal['enabled', 'disabled']
+
+DEBUG_SSE = os.environ.get("DEBUG_SSE", "0") == "1"
+
+
+def _dbg(*args, **kwargs):
+    if DEBUG_SSE:
+        print("[SSE-DEBUG]", *args, file=sys.stderr, **kwargs)
+
 
 class DeepSeekError(Exception):
     """Base exception for all DeepSeek API errors"""
     pass
 
+
 class AuthenticationError(DeepSeekError):
     """Raised when authentication fails"""
     pass
+
 
 class RateLimitError(DeepSeekError):
     """Raised when API rate limit is exceeded"""
     pass
 
+
 class NetworkError(DeepSeekError):
     """Raised when network communication fails"""
     pass
 
+
 class CloudflareError(DeepSeekError):
     """Raised when Cloudflare blocks the request"""
     pass
+
 
 class APIError(DeepSeekError):
     """Raised when API returns an error response"""
@@ -36,192 +50,310 @@ class APIError(DeepSeekError):
         super().__init__(message)
         self.status_code = status_code
 
+
 class SSEMessageParser:
-        def __init__(self):
-            self.thinking_content = ""
-            self.content = ""
-            self.finished_status = None
-            self.current_section = None   # 'thinking' یا 'content'
-            self.response_message_id=None
+    """
+    پارسر SSE دیپ‌سیک که هر سه فرمت واقعی را پشتیبانی می‌کند:
 
-        def parse_sse(self, chunk):
-            """
-            یک خط (bytes) از iter_lines() می‌گیرد.
-            در طول جمع‌آوری، None برمی‌گرداند.
-            فقط وقتی وضعیت FINISHED را ببیند، دیکشنری نهایی را برمی‌گرداند.
-            """
-            if isinstance(chunk, bytes):
-                chunk = chunk.decode('utf-8')
+    فرمت ۱ (توکن خام):
+        {"v": " Hello"}
 
-            # حذف پیشوندهای رایج SSE
-            json_str = chunk
-            if chunk.startswith('data: '):
-                json_str = chunk[6:]
-            # اگر خط خالی یا نامربوط بود، رد شو
-            if not json_str.strip():
-                return None
+    فرمت ۲ (fragment اولیه):
+        {"p": "response/fragments", "o": "APPEND",
+         "v": [{"id": 3, "type": "RESPONSE", "content": "Hello", ...}]}
 
-            try:
-                obj = json.loads(json_str)
-            except json.JSONDecodeError:
-                return None   # خطی که JSON نیست را نادیده بگیر
-            
-            if 'response_message_id' in obj:
-                self.response_message_id=obj['response_message_id']
-                return None
-            
-            p = obj.get('p')
-            v = obj.get('v', '')
-            o = obj.get('o')
+    فرمت ۳ (آپدیت افزایشی):
+        {"p": "response/fragments/-1/content", "v": "!"}
+        {"p": "response/fragments/-1/thinking_content", "v": "..."}
 
-            if p:   # شروع یک بخش جدید
-                # بخش قبلی را کامل کن (اگر بافر خالی بود کاری نکن)
-                # اما در طراحی ما، بافر به‌صورت پیوسته ساخته می‌شود.
+    فرمت ۴ (وضعیت):
+        {"p": "response/status", "o": "SET", "v": "FINISHED"}
+        {"p": "response", "o": "BATCH",
+         "v": [{"p": "quasi_status", "v": "FINISHED"}]}
+    """
 
-                if p == 'response/thinking_content':
-                    self.current_section = 'thinking'
-                    self.thinking_content = str(v) if v else ""
-                elif p == 'response/content':
-                    self.current_section = 'content'
-                    self.content = str(v) if v else ""
-                elif p == 'response/status':
-                    self.finished_status = v
-                    self.current_section = None
-                    # به محض دریافت پایان، دیکشنری نهایی را برگردان
-                    return {
-                        'response_message_id':self.response_message_id,
-                        'thinking_content': self.thinking_content,
-                        'content': self.content,
-                        'finished_status': self.finished_status
-                    }
+    def __init__(self):
+        self.thinking_content = ""
+        self.content = ""
+        self.finished_status = None
+        self.current_section = None
+        self.response_message_id = None
+        self._emitted_finished = False
+
+    # ------------------------------------------------------------------
+    def _decode(self, chunk) -> Optional[dict]:
+        if isinstance(chunk, bytes):
+            chunk = chunk.decode('utf-8', 'ignore')
+
+        json_str = chunk
+        if chunk.startswith('data: '):
+            json_str = chunk[6:]
+        elif chunk.startswith('S.m: '):
+            json_str = chunk[5:]
+
+        if not json_str.strip():
+            return None
+
+        try:
+            obj = json.loads(json_str)
+        except json.JSONDecodeError:
+            return None
+
+        _dbg("RAW:", json_str[:400])
+        return obj
+
+    # ------------------------------------------------------------------
+    def _process(self, obj: dict):
+        """از یک payload، صفر یا چند partial yield می‌کند."""
+
+        # --- response_message_id در سطح بالا ---
+        if 'response_message_id' in obj and len(obj) <= 3:
+            self.response_message_id = obj['response_message_id']
+            return
+
+        p = obj.get('p')
+        o = obj.get('o')
+        v = obj.get('v', '')
+
+        # --- BATCH: v یک لیست از sub-ops ---
+        if o == 'BATCH' and isinstance(v, list):
+            for sub in v:
+                if isinstance(sub, dict):
+                    yield from self._process(sub)
+            return
+
+        # --- v یک dict است ---
+        if isinstance(v, dict):
+            yield from self._process_nested(v)
+            return
+
+        # --- v یک لیست است (response/fragments) ---
+        if isinstance(v, list):
+            yield from self._process_fragments(v)
+            return
+
+        # --- توکن خام: {"v": "..."} بدون p ---
+        if not p and isinstance(v, str) and v:
+            if self.current_section == 'thinking':
+                self.thinking_content += v
+                yield {
+                    'type': 'thinking',
+                    'delta': v,
+                    'accumulated': self.thinking_content,
+                    'finished': False,
+                    'response_message_id': self.response_message_id,
+                }
+            elif self.current_section == 'content':
+                self.content += v
+                yield {
+                    'type': 'content',
+                    'delta': v,
+                    'accumulated': self.content,
+                    'finished': False,
+                    'response_message_id': self.response_message_id,
+                }
+            return
+
+        # --- p-based (SET / APPEND) ---
+        if p:
+            # مسیرهای content
+            if p.endswith('/content') or p == 'response/content':
+                is_thinking = 'thinking' in p
+                new_v = str(v) if v is not None else ""
+                if o == 'APPEND':
+                    if is_thinking:
+                        self.thinking_content += new_v
+                    else:
+                        self.content += new_v
                 else:
-                    # سایر p ها (مثل elapsed_secs) – بخش جاری را باطل کن ولی محتوا حفظ شود
-                    self.current_section = None
-            else:
-                # خط الحاقی (APPEND) بدون p
-                if self.current_section == 'thinking':
-                    self.thinking_content += str(v)
-                elif self.current_section == 'content':
-                    self.content += str(v)
+                    if is_thinking:
+                        self.thinking_content = new_v
+                    else:
+                        self.content = new_v
 
-            return None   # هنوز کار تمام نشده
-
-        def parse_sse_streaming(self, chunk):
-            """
-            نسخه streaming parse_sse.
-            هر chunk را پردازش می‌کند و در صورت اضافه شدن متن (delta)، آن را yield می‌کند.
-            در پایان، دیکشنری نهایی را yield کرده و متوقف می‌شود.
-            """
-            if isinstance(chunk, bytes):
-                chunk = chunk.decode('utf-8')
-
-            # حذف پیشوندهای رایج SSE
-            json_str = chunk
-            if chunk.startswith('data: '):
-                json_str = chunk[6:]
-            elif chunk.startswith('S.m: '):
-                json_str = chunk[5:]
-
-            if not json_str.strip():
-                return  # nothing to yield
-
-            try:
-                obj = json.loads(json_str)
-            except json.JSONDecodeError:
-                return
-
-            if 'response_message_id' in obj:
-                self.response_message_id = obj['response_message_id']
-                # در streaming، id را هم می‌توان yield کرد اما فعلاً نیازی نیست
-                return
-
-            p = obj.get('p')
-            v = str(obj.get('v', ''))
-            o = obj.get('o')
-
-            if p:
-                if p == 'response/thinking_content':
-                    # شروع بخش thinking
+                if is_thinking:
                     self.current_section = 'thinking'
-                    # مقدار قبلی را با v جدید جایگزین کن (طبق منطق اصلی)
-                    # اما در streaming، ممکن است بخواهیم کل محتوا را بفرستیم
-                    old_len = len(self.thinking_content)
-                    self.thinking_content = v
-                    # اگر مقدار جدیدی اضافه شده (نه فقط جایگزینی)، ولی در اینجا v کل محتواست
-                    # بنابراین بهتر است کل accumulated را yield کنیم
+                    if new_v:
+                        yield {
+                            'type': 'thinking',
+                            'delta': new_v,
+                            'accumulated': self.thinking_content,
+                            'finished': False,
+                            'response_message_id': self.response_message_id,
+                        }
+                else:
+                    self.current_section = 'content'
+                    if new_v:
+                        yield {
+                            'type': 'content',
+                            'delta': new_v,
+                            'accumulated': self.content,
+                            'finished': False,
+                            'response_message_id': self.response_message_id,
+                        }
+                return
+
+            # مسیرهای thinking_content
+            if 'thinking_content' in p:
+                new_v = str(v) if v is not None else ""
+                if o == 'APPEND':
+                    self.thinking_content += new_v
+                else:
+                    self.thinking_content = new_v
+                self.current_section = 'thinking'
+                if new_v:
                     yield {
                         'type': 'thinking',
-                        'delta': v,
+                        'delta': new_v,
                         'accumulated': self.thinking_content,
                         'finished': False,
-                        'response_message_id': self.response_message_id
+                        'response_message_id': self.response_message_id,
                     }
-                elif p == 'response/content':
-                    self.current_section = 'content'
-                    old_len = len(self.content)
-                    self.content = v
-                    yield {
-                        'type': 'content',
-                        'delta': v,
-                        'accumulated': self.content,
-                        'finished': False,
-                        'response_message_id': self.response_message_id
-                    }
-                elif p == 'response/status':
-                    self.finished_status = v
-                    self.current_section = None
+                return
+
+            # وضعیت
+            if p == 'response/status':
+                self.finished_status = v
+                self.current_section = None
+                if not self._emitted_finished:
+                    self._emitted_finished = True
                     yield {
                         'type': 'finished',
-                        'finished_status': self.finished_status,
+                        'finished_status': v,
                         'response_message_id': self.response_message_id,
                         'thinking_content': self.thinking_content,
-                        'content': self.content
+                        'content': self.content,
                     }
-                    # بعد از finish، مولد پایان می‌یابد (اما نیازی به return صریح نیست چون function تمام می‌شود)
-                else:
-                    # سایر p ها (مثل elapsed_secs) – بخش جاری را باطل کن ولی محتوا حفظ شود
-                    self.current_section = None
-            else:
-                # خط الحاقی (APPEND) بدون p
-                if self.current_section == 'thinking':
-                    self.thinking_content += v
+                return
+
+            # سایر مسیرها را نادیده بگیر
+            return
+
+    # ------------------------------------------------------------------
+    def _process_fragments(self, fragments: list):
+        """پردازش آرایه response/fragments"""
+        for frag in fragments:
+            if not isinstance(frag, dict):
+                continue
+            frag_type = frag.get('type', '')
+            frag_content = frag.get('content', '')
+
+            if frag_type == 'THINKING':
+                self.thinking_content = frag_content
+                self.current_section = 'thinking'
+                if frag_content:
                     yield {
                         'type': 'thinking',
-                        'delta': v,
+                        'delta': frag_content,
                         'accumulated': self.thinking_content,
                         'finished': False,
-                        'response_message_id': self.response_message_id
+                        'response_message_id': self.response_message_id,
                     }
-                elif self.current_section == 'content':
-                    self.content += v
+            elif frag_type == 'RESPONSE':
+                self.content = frag_content
+                self.current_section = 'content'
+                if frag_content:
                     yield {
                         'type': 'content',
-                        'delta': v,
+                        'delta': frag_content,
                         'accumulated': self.content,
                         'finished': False,
-                        'response_message_id': self.response_message_id
+                        'response_message_id': self.response_message_id,
                     }
-                # در غیر این صورت چیزی yield نمی‌شود
+
+    # ------------------------------------------------------------------
+    def _process_nested(self, v: dict):
+        """پردازش دیکشنری تودرتو"""
+        resp = v.get('response') if 'response' in v else v
+        if not isinstance(resp, dict):
+            return
+
+        tc = resp.get('thinking_content')
+        if isinstance(tc, str) and tc:
+            if tc.startswith(self.thinking_content):
+                delta = tc[len(self.thinking_content):]
+            else:
+                delta = tc
+            self.thinking_content = tc
+            if delta:
+                yield {
+                    'type': 'thinking',
+                    'delta': delta,
+                    'accumulated': self.thinking_content,
+                    'finished': False,
+                    'response_message_id': self.response_message_id,
+                }
+
+        ct = resp.get('content')
+        if isinstance(ct, str) and ct:
+            if ct.startswith(self.content):
+                delta = ct[len(self.content):]
+            else:
+                delta = ct
+            self.content = ct
+            if delta:
+                yield {
+                    'type': 'content',
+                    'delta': delta,
+                    'accumulated': self.content,
+                    'finished': False,
+                    'response_message_id': self.response_message_id,
+                }
+
+        st = resp.get('status')
+        if st:
+            self.finished_status = st
+            if st == 'FINISHED' and not self._emitted_finished:
+                self._emitted_finished = True
+                yield {
+                    'type': 'finished',
+                    'finished_status': st,
+                    'response_message_id': self.response_message_id,
+                    'thinking_content': self.thinking_content,
+                    'content': self.content,
+                }
+
+    # ------------------------------------------------------------------
+    # API عمومی
+    # ------------------------------------------------------------------
+    def parse_sse_streaming(self, chunk):
+        obj = self._decode(chunk)
+        if obj is None:
+            return
+        yield from self._process(obj)
+
+    def parse_sse(self, chunk):
+        obj = self._decode(chunk)
+        if obj is None:
+            return None
+        result = None
+        for partial in self._process(obj):
+            if partial.get('type') == 'finished':
+                result = {
+                    'response_message_id': self.response_message_id,
+                    'thinking_content': self.thinking_content,
+                    'content': self.content,
+                    'finished_status': self.finished_status,
+                }
+        return result
+
 
 class DeepSeekAPI:
     BASE_URL = "https://chat.deepseek.com/api/v0"
 
     def __init__(self, auth_token: str):
-        self.sse_parser=SSEMessageParser()
         if not auth_token or not isinstance(auth_token, str):
             raise AuthenticationError("Invalid auth token provided")
 
         try:
             from importlib.metadata import distribution, PackageNotFoundError
-            curl_cffi_version = distribution('curl-cffi').version
+            distribution('curl-cffi').version
         except PackageNotFoundError:
-            print("\033[93mWarning: curl-cffi not found. Please install the latest version", file=sys.stderr)
-            print("pip install curl-cffi\033[0m", file=sys.stderr)
+            print("\033[93mWarning: curl-cffi not found. Please install: pip install curl-cffi\033[0m", file=sys.stderr)
 
         self.auth_token = auth_token
         self.pow_solver = DeepSeekPOW()
 
-        # Load cookies from JSON file
         cookies_path = Path(__file__).parent / 'cookies.json'
         try:
             with open(cookies_path, 'r') as f:
@@ -245,36 +377,23 @@ class DeepSeekAPI:
             'x-client-platform': 'web',
             'x-client-version': '1.0.0-always',
         }
-
         if pow_response:
             headers['x-ds-pow-response'] = pow_response
-
         return headers
 
     def _refresh_cookies(self) -> None:
-        """Run the cookie refresh script and reload cookies"""
         try:
-            # Get path to bypass.py
             script_path = Path(__file__).parent / 'bypass.py'
-
-            # Run the script
             subprocess.run([sys.executable, script_path], check=True)
-
-            # Wait briefly for cookies file to be written
             time.sleep(2)
-
-            # Reload cookies
             cookies_path = Path(__file__).parent / 'cookies.json'
             with open(cookies_path, 'r') as f:
-                cookie_data = json.load(f)
-                self.cookies = cookie_data.get('cookies', {})
-
+                self.cookies = json.load(f).get('cookies', {})
         except Exception as e:
             print(f"\033[93mWarning: Failed to refresh cookies: {e}\033[0m", file=sys.stderr)
 
     def _make_request(self, method: str, endpoint: str, json_data: Dict[str, Any], pow_required: bool = False) -> Any:
         url = f"{self.BASE_URL}{endpoint}"
-
         retry_count = 0
         max_retries = 2
 
@@ -287,24 +406,17 @@ class DeepSeekAPI:
                     headers = self._get_headers(pow_response)
 
                 response = requests.request(
-                    method=method,
-                    url=url,
-                    headers=headers,
-                    json=json_data,
-                    cookies=self.cookies,
-                    impersonate='chrome120',
-                    timeout=None
+                    method=method, url=url, headers=headers, json=json_data,
+                    cookies=self.cookies, impersonate='chrome120', timeout=None
                 )
 
-                # Check if we hit Cloudflare protection
                 if "<!DOCTYPE html>" in response.text and "Just a moment" in response.text:
                     print("\033[93mWarning: Cloudflare protection detected. Bypassing...\033[0m", file=sys.stderr)
                     if retry_count < max_retries - 1:
-                        self._refresh_cookies()  # Refresh cookies
+                        self._refresh_cookies()
                         retry_count += 1
                         continue
 
-                # Handle other response codes
                 if response.status_code == 401:
                     raise AuthenticationError("Invalid or expired authentication token")
                 elif response.status_code == 429:
@@ -326,8 +438,7 @@ class DeepSeekAPI:
     def _get_pow_challenge(self) -> Dict[str, Any]:
         try:
             response = self._make_request(
-                'POST',
-                '/chat/create_pow_challenge',
+                'POST', '/chat/create_pow_challenge',
                 {'target_path': '/api/v0/chat/completion'}
             )
             return response['data']['biz_data']['challenge']
@@ -337,39 +448,17 @@ class DeepSeekAPI:
     def create_chat_session(self) -> str:
         """Creates a new chat session and returns the session ID"""
         try:
-            response = self._make_request(
-                'POST',
-                '/chat_session/create',
-                {'character_id': None}
-            )
+            response = self._make_request('POST', '/chat_session/create', {'character_id': None})
             return response['data']['biz_data']['id']
         except KeyError:
             raise APIError("Invalid session creation response format from server")
 
-    def chat_completion(self,
-                    chat_session_id: str,
-                    prompt: str,
-                    parent_message_id: Optional[str] = None,
-                    thinking_enabled: bool = True,
-                    search_enabled: bool = True) -> Generator[Dict[str, Any], None, None]:
+    def chat_completion(self, chat_session_id: str, prompt: str,
+                        parent_message_id: Optional[str] = None,
+                        thinking_enabled: bool = True,
+                        search_enabled: bool = True) -> Generator[Dict[str, Any], None, None]:
         """
-        Send a message and get streaming response
-
-        Args:
-            chat_session_id (str): The ID of the chat session
-            prompt (str): The message to send
-            parent_message_id (Optional[str]): ID of the parent message for threading
-            thinking_enabled (bool): Whether to show the thinking process
-            search_enabled (bool): Whether to enable web search for up-to-date information
-
-        Returns:
-            Generator[Dict[str, Any], None, None]: Yields message chunks with content and type
-
-        Raises:
-            AuthenticationError: If the authentication token is invalid
-            RateLimitError: If the API rate limit is exceeded
-            NetworkError: If a network error occurs
-            APIError: If any other API error occurs
+        Send a message and get streaming response.
         """
         if not prompt or not isinstance(prompt, str):
             raise ValueError("Prompt must be a non-empty string")
@@ -387,19 +476,13 @@ class DeepSeekAPI:
 
         try:
             headers = self._get_headers(
-                pow_response=self.pow_solver.solve_challenge(
-                    self._get_pow_challenge()
-                )
+                pow_response=self.pow_solver.solve_challenge(self._get_pow_challenge())
             )
 
             response = requests.post(
                 f"{self.BASE_URL}/chat/completion",
-                headers=headers,
-                json=json_data,
-                cookies=self.cookies,  # Add cookies
-                impersonate='chrome120',
-                stream=True,
-                timeout=None
+                headers=headers, json=json_data, cookies=self.cookies,
+                impersonate='chrome120', stream=True, timeout=None
             )
 
             if response.status_code != 200:
@@ -411,43 +494,24 @@ class DeepSeekAPI:
                 else:
                     raise APIError(f"API request failed: {error_text}", response.status_code)
 
-            # ایجاد یک parser جدید برای این درخواست (برای جلوگیری از تداخل وضعیت بین درخواست‌ها)
             parser = SSEMessageParser()
             for chunk in response.iter_lines():
                 try:
-                    # استفاده از نسخه streaming
                     for partial in parser.parse_sse_streaming(chunk):
                         yield partial
-                        if partial.get('type') == 'finished' and partial.get('finished_status') == 'FINISHED':
-                            return  # پایان مولد
+                        if partial.get('type') == 'finished':
+                            return
                 except Exception as e:
                     raise APIError(f"Error parsing response chunk: {str(e)}")
 
         except requests.exceptions.RequestException as e:
             raise NetworkError(f"Network error occurred during streaming: {str(e)}")
 
-    def chat_completion_with_messages(self,
-                    chat_session_id: str,
-                    messages: list,
-                    thinking_enabled: bool = True,
-                    search_enabled: bool = True) -> Generator[Dict[str, Any], None, None]:
+    def chat_completion_with_messages(self, chat_session_id: str, messages: list,
+                                      thinking_enabled: bool = True,
+                                      search_enabled: bool = True) -> Generator[Dict[str, Any], None, None]:
         """
-        Send a message and get streaming response
-
-        Args:
-            chat_session_id (str): The ID of the chat session
-            messages (list): The messages to send
-            thinking_enabled (bool): Whether to show the thinking process
-            search_enabled (bool): Whether to enable web search for up-to-date information
-
-        Returns:
-            Generator[Dict[str, Any], None, None]: Yields message chunks with content and type
-
-        Raises:
-            AuthenticationError: If the authentication token is invalid
-            RateLimitError: If the API rate limit is exceeded
-            NetworkError: If a network error occurs
-            APIError: If any other API error occurs
+        Send a message and get streaming response (messages format).
         """
         if not messages or not isinstance(messages, list):
             raise ValueError("messages must be a non-empty list")
@@ -461,19 +525,13 @@ class DeepSeekAPI:
 
         try:
             headers = self._get_headers(
-                pow_response=self.pow_solver.solve_challenge(
-                    self._get_pow_challenge()
-                )
+                pow_response=self.pow_solver.solve_challenge(self._get_pow_challenge())
             )
 
             response = requests.post(
                 f"{self.BASE_URL}/chat/completion",
-                headers=headers,
-                json=json_data,
-                cookies=self.cookies,  # Add cookies
-                impersonate='chrome120',
-                stream=True,
-                timeout=None
+                headers=headers, json=json_data, cookies=self.cookies,
+                impersonate='chrome120', stream=True, timeout=None
             )
 
             if response.status_code != 200:
@@ -485,15 +543,13 @@ class DeepSeekAPI:
                 else:
                     raise APIError(f"API request failed: {error_text}", response.status_code)
 
-            # ایجاد یک parser جدید برای این درخواست (برای جلوگیری از تداخل وضعیت بین درخواست‌ها)
             parser = SSEMessageParser()
             for chunk in response.iter_lines():
                 try:
-                    # استفاده از نسخه streaming
                     for partial in parser.parse_sse_streaming(chunk):
                         yield partial
-                        if partial.get('type') == 'finished' and partial.get('finished_status') == 'FINISHED':
-                            return  # پایان مولد
+                        if partial.get('type') == 'finished':
+                            return
                 except Exception as e:
                     raise APIError(f"Error parsing response chunk: {str(e)}")
 
