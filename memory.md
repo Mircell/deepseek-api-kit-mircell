@@ -80,8 +80,39 @@ Key dependencies (see `requirements.txt`): `fastapi`, `fastapi-offline`, `fastap
 | `DEEPSEEK_API_KEY`   | Your DeepSeek API key (required). |
 | `SESSION_FILE`       | (Optional) Path to the session ID file (default: `.session_id`). |
 | `SESSION_DATA_FILE`  | (Optional) Path to the session data JSON file (default: `.session_data.json`). |
+| `DEBUG_SSE`          | (Optional) Set to `1` to log raw SSE payloads from `common/api.py` to stderr (prefixed `[SSE-DEBUG]`). Default: `0`. |
+| `DEBUG_PROXY`        | (Optional) Set to `1` to enable debug logging in `openai_proxy/main.py` (prefixed `[PROXY-DEBUG]`). Default: `0`. |
 
 All configuration can be set in the `.env` file or directly in the environment.
+
+### Debug Logging
+
+Both the shared client and the standalone proxy expose opt-in debug logging
+that is **silent by default**:
+
+- **`common/api.py`** – `DEBUG_SSE=1` enables `_dbg()`, which prints each raw
+  SSE line (truncated to 400 chars) to `stderr` with an `[SSE-DEBUG]` prefix.
+  Useful for diagnosing DeepSeek stream-format regressions.
+- **`openai_proxy/main.py`** – `DEBUG_PROXY=1` enables a matching `_dbg()`
+  helper (prefix `[PROXY-DEBUG]`) for request/response tracing in the
+  standalone proxy.
+
+### SSE Message Parser (`common/api.py`)
+
+`SSEMessageParser` decodes DeepSeek's web-chat stream, which arrives in
+several shapes. The parser normalizes all of them:
+
+- **Raw token** – `{"v": " Hello"}`.
+- **Initial fragment** – `{"p": "response/fragments", "o": "APPEND",
+  "v": [{"id": 3, "type": "RESPONSE", "content": "Hello", ...}]}`.
+- **Incremental update** – `{"p": "response/fragments/-1/content", "v": "!"}`
+  and `{"p": "response/fragments/-1/thinking_content", "v": "..."}`.
+- **Status** – `{"p": "response/status", "o": "SET", "v": "FINISHED"}` and the
+  batched form `{"p": "response", "o": "BATCH", "v": [{"p": "quasi_status",
+  "v": "FINISHED"}]}`.
+
+The parser also strips the `data: ` / `S.m: ` transport prefixes, tolerates
+undecodable chunks, and captures `response_message_id` for session continuity.
 
 ---
 
@@ -121,7 +152,7 @@ deepseek-api-kit/
 ├── .env.example                 # Example environment file
 ├── .session_data.json           # Persistent session data (auto-generated)
 ├── .session_id                  # Session ID file (auto-generated)
-├── deepseek_harness.bat         # Windows batch: run deepseek_harness on port 8002
+├── deepseek-harness.bat         # Windows batch: run deepseek_harness on port 8002
 ├── deepseek-api.bat             # Windows batch: run the proxy server
 ├── vscode-chat.bat              # Windows batch: run the VS Code chat proxy
 ├── example.py                   # Example usage script
@@ -338,7 +369,7 @@ files and restarting).
 
 ### Base URLs
 
-- `deepseek_harness`: `http://localhost:8002` (see `deepseek_harness.bat`)
+- `deepseek_harness`: `http://localhost:8002` (see `deepseek-harness.bat`)
 - `openai_proxy`: `http://localhost:8000` (default)
 
 ### Endpoints
@@ -469,7 +500,7 @@ python send_with_session.py "Your message here"
 ```
 
 ### `.bat` launchers (Windows)
-- `deepseek_harness.bat` – starts the harness provider on port `8002`:
+- `deepseek-harness.bat` – starts the harness provider on port `8002`:
   `uvicorn deepseek_harness.main:app --host 127.0.0.1 --port 8002`
 - `deepseek-api.bat` – starts the standalone proxy.
 - `vscode-chat.bat` – starts the VS Code chat proxy.
